@@ -1,27 +1,21 @@
 #!/bin/bash
 
-# Diretório de composes
 COMPOSE_DIR="/app/docker"
-
-# Diretório de log
 LOG_DIR="/var/log/docker-updater"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/$(date +'%Y-%m-%d').log"
 
-# Webhook do Discord
 DISCORD_WEBHOOK="SUA URL DISCORD AQUI"
 
-# Função para registrar logs com timestamp
 log() {
     echo "$(date +'%F %T') - $1" | tee -a "$LOG_FILE"
 }
 
-# Função para enviar mensagem ao Discord
 send_discord() {
     local message="$1"
     curl -s -H "Content-Type: application/json" \
          -X POST \
-         -d "{\"content\": \"$message\"}" \
+         -d "$(jq -nc --arg content "$message" '{content: $content}')" \
          "$DISCORD_WEBHOOK" > /dev/null
 }
 
@@ -30,7 +24,6 @@ log "🔄 Iniciando verificação de atualizações de containers Docker..."
 UPDATED_CONTAINERS=()
 ERRORS=()
 
-# Procurar arquivos docker-compose.{yml,yaml}
 find "$COMPOSE_DIR" -type f \( -name "docker-compose.yml" -o -name "docker-compose.yaml" \) | while read -r COMPOSE_FILE; do
     COMPOSE_PATH=$(dirname "$COMPOSE_FILE")
     log "📁 Verificando compose em: $COMPOSE_PATH"
@@ -42,8 +35,8 @@ find "$COMPOSE_DIR" -type f \( -name "docker-compose.yml" -o -name "docker-compo
     echo "$OUTPUT" >> "$LOG_FILE"
 
     if echo "$OUTPUT" | grep -q "Downloaded newer image"; then
-        log "🔄 Atualizações encontradas, subindo novos containers..."
-        if docker compose up -d --remove-orphans >> "$LOG_FILE" 2>&1; then
+        log "🔄 Atualizações encontradas, subindo novos containers com --force-recreate..."
+        if docker compose up -d --remove-orphans --force-recreate >> "$LOG_FILE" 2>&1; then
             UPDATED_CONTAINERS+=("$COMPOSE_PATH")
             log "✅ Atualizado com sucesso: $COMPOSE_PATH"
         else
