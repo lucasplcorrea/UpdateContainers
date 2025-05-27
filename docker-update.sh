@@ -15,23 +15,17 @@ log() {
     printf '%s - %s\n' "$(date +'%F %T')" "$1" | tee -a "$LOG_FILE"
 }
 
-# Função revisada para enviar notificações ao Discord, tratando melhor as quebras de linha
+# Função revisada para enviar notificações ao Discord usando jq
 send_discord() {
     local message="$1"
-    # Escapa aspas duplas e barras invertidas na mensagem para o JSON
-    local json_message
-    json_message=$(echo "$message" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g')
-    # Substitui novas linhas literais por \n para o JSON
-    json_message=$(echo "$json_message" | awk '{printf "%s\\n", $0}' | sed 's/\\n$//')
-
-    # Monta o payload JSON manualmente com printf para garantir a formatação correta
+    # Usa jq para construir o payload JSON corretamente, tratando novas linhas e caracteres especiais
     local payload
-    payload=$(printf '{"content": "%s"}' "$json_message")
+    payload=$(jq -nc --arg content "$message" '{content: $content}')
 
-    # Envia usando curl, passando o payload via stdin
-    if ! echo "$payload" | curl -s -f -H "Content-Type: application/json" \
+    # Envia usando curl
+    if ! curl -s -f -H "Content-Type: application/json" \
          -X POST \
-         -d @- \
+         -d "$payload" \
          "$DISCORD_WEBHOOK" > /dev/null; then
         log "❌ Falha ao enviar notificação para o Discord."
     fi
@@ -40,9 +34,9 @@ send_discord() {
 log "🔄 Iniciando verificação de atualizações de containers Docker..."
 
 # Inicializa arrays e array associativo (requer Bash 4+)
-UPDATED_COMPOSE_PATHS=()
+UPDATED_COMPOSE_INFO=()
 ERRORS=()
-declare -A PULLED_IMAGES_MAP # Armazena imagens que foram efetivamente puxadas/atualizadas
+declare -A ACTUAL_UPDATES_MAP # Armazena apenas composes com imagens realmente atualizadas
 
 # Usa process substitution para evitar subshell no loop while
 while IFS= read -r COMPOSE_FILE; do
@@ -66,67 +60,53 @@ while IFS= read -r COMPOSE_FILE; do
         log "❌ Falha no pull para $COMPOSE_PATH (Código de saída: $pull_exit_code)"
         echo "$PULL_OUTPUT" >> "$LOG_FILE"
         ERRORS+=("Erro no pull em $COMPOSE_PATH")
-        # Não continua aqui, ainda pode haver atualizações parciais ou necessidade de 'up'
+        # Mesmo com falha no pull, continua para o popd
     else
         log "Resultado do pull para $COMPOSE_PATH: Sucesso (verificar logs para detalhes)"
         echo "$PULL_OUTPUT" >> "$LOG_FILE"
     fi
 
-    # --- Extrair imagens atualizadas/puxadas da saída do PULL --- 
-    pulled_images_list=""
-    # Procura por linhas indicando download ou pull completo
-    # Ajuste o padrão grep/awk conforme necessário para sua versão do Docker Compose
-    while IFS= read -r line; do
-        # Exemplo: Extrair de linhas como "Pulled meu-servico" ou "Downloaded newer image for minha/imagem:tag"
-        # Este grep/awk é um exemplo, pode precisar de ajuste fino
-        image_name=$(echo "$line" | grep -oE '([a-zA-Z0-9./_-]+:[a-zA-Z0-9._-]+|[a-zA-Z0-9./_-]+@sha256:[a-f0-9]+)$' || true)
-        if [[ -z "$image_name" ]]; then
-             # Tenta extrair de linhas como 'Pulled <serviço>' pegando a imagem do compose file (mais complexo)
-             # Ou simplesmente pega a linha inteira como indicação
-             image_name=$(echo "$line" | awk '{print $NF}') # Pega a última palavra como fallback
-        fi
-        if [[ -n "$image_name" ]]; then
-             # Evita duplicatas simples
-             if ! echo "$pulled_images_list" | grep -qF "$image_name"; then
-                 pulled_images_list+="* $image_name\n"
-             fi
-        fi
-    done < <(echo "$PULL_OUTPUT" | grep -E 'Downloaded newer image|Pulled|Layer already exists|Digest:')
-    # --- Fim da extração --- 
-
-    # Verifica se o PULL teve sucesso E se houve output indicando novas imagens
-    # A condição `grep -q` é uma heurística, pode precisar de ajuste
-    NEEDS_UP=false
-    if $PULL_SUCCESS && echo "$PULL_OUTPUT" | grep -q -E 'Downloaded newer image|Pulled'; then
-        NEEDS_UP=true
-        log "🔄 Novas imagens detectadas para $COMPOSE_PATH, subindo containers..."
-    elif ! $PULL_SUCCESS; then
-        # Mesmo se o pull falhou, tenta um 'up' para garantir que os serviços estejam rodando (opcional)
-        # NEEDS_UP=true
-        # log "⚠️ Pull falhou, tentando 'up -d' para garantir estado..."
-        log "⚠️ Pull falhou para $COMPOSE_PATH. Pulando 'up'."
-    else
-        log "✅ Nenhuma atualização de imagem encontrada para: $COMPOSE_PATH"
+    # --- Verifica se HOUVE REALMENTE atualização de imagem --- 
+    IMAGE_WAS_UPDATED=false
+    if $PULL_SUCCESS && echo "$PULL_OUTPUT" | grep -q -E 'Downloaded newer image|Newer image'; then
+        IMAGE_WAS_UPDATED=true
+        log "✅ Novas imagens baixadas para $COMPOSE_PATH."
+    elif $PULL_SUCCESS; then
+        log "✅ Nenhuma imagem nova baixada para $COMPOSE_PATH (apenas verificado/pull completo)."
     fi
+    # --- Fim da verificação --- 
 
-    if $NEEDS_UP; then
+    # Só executa 'up' se uma imagem foi realmente atualizada
+    if $IMAGE_WAS_UPDATED; then
         log "🚀 Executando 'docker compose up -d --remove-orphans --force-recreate' para $COMPOSE_PATH..."
         # Captura a saída e o status de saída do up
         if UP_OUTPUT=$(docker compose up -d --remove-orphans --force-recreate 2>&1); then
-            log "✅ Atualizado com sucesso: $COMPOSE_PATH"
+            log "✅ Atualizado com sucesso via 'up': $COMPOSE_PATH"
             echo "$UP_OUTPUT" >> "$LOG_FILE"
-            UPDATED_COMPOSE_PATHS+=("$COMPOSE_PATH")
-            # Armazena a lista de imagens puxadas para este compose
-            if [[ -n "$pulled_images_list" ]]; then
-                PULLED_IMAGES_MAP["$COMPOSE_PATH"]="$pulled_images_list"
-            else
-                # Se não conseguiu extrair, coloca uma mensagem genérica
-                PULLED_IMAGES_MAP["$COMPOSE_PATH"]="*(Nenhuma imagem específica detectada na saída do pull)*\n"
+            
+            # Extrai as imagens que foram efetivamente atualizadas (puxadas)
+            updated_images_list=""
+            while IFS= read -r line; do
+                # Tenta extrair nomes de imagem da saída do pull que indicam atualização
+                image_name=$(echo "$line" | grep -oE '([a-zA-Z0-9./_-]+:[a-zA-Z0-9._-]+|[a-zA-Z0-9./_-]+@sha256:[a-f0-9]+)$' || true)
+                 if [[ -n "$image_name" ]]; then
+                     # Evita duplicatas simples
+                     if ! echo "$updated_images_list" | grep -qF "$image_name"; then
+                         updated_images_list+="- $image_name\n"
+                     fi
+                 fi
+            done < <(echo "$PULL_OUTPUT" | grep -E 'Downloaded newer image|Newer image')
+
+            if [[ -z "$updated_images_list" ]]; then
+                 updated_images_list="*(Não foi possível extrair nomes específicos das imagens atualizadas)*\n"
             fi
+            ACTUAL_UPDATES_MAP["$COMPOSE_PATH"]="$updated_images_list"
+            UPDATED_COMPOSE_INFO+=("$COMPOSE_PATH") # Adiciona à lista geral de sucessos
+
         else
             up_exit_code=$?
-            ERRORS+=("Erro ao atualizar $COMPOSE_PATH (Código de saída: $up_exit_code)")
-            log "❌ Falha ao atualizar: $COMPOSE_PATH (Código de saída: $up_exit_code)"
+            ERRORS+=("Erro ao executar 'up' em $COMPOSE_PATH (Código de saída: $up_exit_code)")
+            log "❌ Falha ao executar 'up': $COMPOSE_PATH (Código de saída: $up_exit_code)"
             echo "$UP_OUTPUT" >> "$LOG_FILE"
         fi
     fi
@@ -142,17 +122,20 @@ if ! docker image prune -af >> "$LOG_FILE" 2>&1; then
     ERRORS+=("Erro durante docker image prune -af")
 fi
 
-# Verifica e envia notificações
-if [ ${#UPDATED_COMPOSE_PATHS[@]} -gt 0 ]; then
-    # Usa printf para construir a mensagem com quebras de linha literais
-    msg=$(printf "🚀 **Atualizações aplicadas nos seguintes composes:**\n\n")
-    for path in "${UPDATED_COMPOSE_PATHS[@]}"; do
+# --- Envio de Notificações --- 
+
+# Notificação de SUCESSO (Apenas se houve atualizações REAIS)
+if [ ${#UPDATED_COMPOSE_INFO[@]} -gt 0 ]; then
+    # Usa printf para construir a mensagem com quebras de linha duplas para Markdown
+    msg=$(printf "🚀 **Atualizações aplicadas com sucesso:**\n\n") 
+    for path in "${UPDATED_COMPOSE_INFO[@]}"; do
         msg+=$(printf "📁 **%s**\n" "$path")
-        if [[ -v PULLED_IMAGES_MAP["$path"] ]]; then
+        if [[ -v ACTUAL_UPDATES_MAP["$path"] ]]; then
              # Adiciona a lista de imagens, garantindo que termine com newline
-             images_info=$(printf "%s" "${PULLED_IMAGES_MAP["$path"]}")
-             msg+=$(printf "%s\n" "$images_info")
+             images_info=$(printf "%s" "${ACTUAL_UPDATES_MAP["$path"]}")
+             msg+=$(printf "%s\n" "$images_info") # Adiciona uma linha extra em branco após a lista de imagens
         else
+             # Este caso não deveria ocorrer se entrou aqui, mas por segurança
              msg+=$(printf "  *(Detalhes da imagem não capturados)*\n\n")
         fi
     done
@@ -160,13 +143,19 @@ if [ ${#UPDATED_COMPOSE_PATHS[@]} -gt 0 ]; then
     send_discord "$msg"
 fi
 
+# Notificação de ERRO (Sempre envia se houver erros)
 if [ ${#ERRORS[@]} -gt 0 ]; then
     mapfile -t error_list < <(printf '%s\n' "${ERRORS[@]}")
-    # Usa printf para construir a mensagem de erro
-    error_items=$(printf '* %s\n' "${error_list[@]}")
-    msg=$(printf "⚠️ **Erros durante atualização:**\n%s" "$error_items")
+    # Usa printf para construir a mensagem de erro com itens de lista Markdown
+    error_items=$(printf -- '- %s\n' "${error_list[@]}")
+    msg=$(printf "⚠️ **Erros encontrados durante a atualização:**\n%s" "$error_items")
     log "📣 Enviando notificação de erro..."
     send_discord "$msg"
 fi
 
-log "✅ Script finalizado."
+# Mensagem final no log se não houve atualizações nem erros
+if [ ${#UPDATED_COMPOSE_INFO[@]} -eq 0 ] && [ ${#ERRORS[@]} -eq 0 ]; then
+    log "✅ Verificação concluída. Nenhuma atualização de imagem encontrada e nenhum erro reportado."
+fi
+
+log "🏁 Script finalizado."
