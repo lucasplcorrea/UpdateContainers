@@ -28,17 +28,40 @@ send_discord() {
 
 log "🔄 Iniciando verificação de atualizações de containers Docker..."
 
-# Inicializa arrays fora do loop
-UPDATED_CONTAINERS=()
+# Inicializa arrays e array associativo (requer Bash 4+)
+UPDATED_COMPOSE_PATHS=()
 ERRORS=()
+declare -A UPDATED_IMAGES_MAP
 
 # Usa process substitution para evitar subshell no loop while
 while IFS= read -r COMPOSE_FILE; do
     # Usa pushd/popd para gerenciar diretórios de forma mais segura
-    pushd "$(dirname "$COMPOSE_FILE")" > /dev/null || { log "❌ Falha ao acessar $(dirname "$COMPOSE_FILE")"; ERRORS+=("Erro ao acessar $(dirname "$COMPOSE_FILE")"); continue; }
+    if ! pushd "$(dirname "$COMPOSE_FILE")" > /dev/null; then
+        log "❌ Falha ao acessar $(dirname "$COMPOSE_FILE")"
+        ERRORS+=("Erro ao acessar $(dirname "$COMPOSE_FILE")")
+        continue
+    fi
     COMPOSE_PATH=$(pwd) # Pega o caminho absoluto após entrar no diretório
 
     log "📁 Verificando compose em: $COMPOSE_PATH"
+
+    # --- Capturar imagens atuais ANTES do pull --- 
+    declare -A current_images
+    log "🔎 Capturando imagens atuais para $COMPOSE_PATH..."
+    # Usar 'docker compose ps' para obter serviços e suas imagens atuais
+    # O estado pode ser 'running', 'exited', etc. Incluímos todos.
+    while IFS= read -r line; do
+        # Ignora linha de cabeçalho ou linhas vazias
+        [[ -z "$line" || "$line" == NAME* ]] && continue
+        # Extrai nome do serviço e imagem (ajuste os índices se necessário)
+        service_name=$(echo "$line" | awk '{print $1}') # Assume que o nome do serviço é a primeira coluna
+        image_name=$(echo "$line" | awk '{print $2}')   # Assume que a imagem é a segunda coluna
+        if [[ -n "$service_name" && -n "$image_name" ]]; then
+            current_images["$service_name"]="$image_name"
+            # log "  -> Serviço: $service_name, Imagem Atual: $image_name" # Log detalhado (opcional)
+        fi
+    done < <(docker compose ps --format "{{.Name}} {{.Image}}" 2>/dev/null || true) # Ignora erro se não houver containers rodando
+    # --- Fim da captura de imagens atuais --- 
 
     log "📥 Fazendo pull das imagens..."
     # Captura a saída e o status de saída do pull
@@ -55,13 +78,42 @@ while IFS= read -r COMPOSE_FILE; do
     fi
 
     # Verifica se houve download de novas imagens
-    if echo "$OUTPUT" | grep -q -E 'Pull complete|Downloaded newer image|Newer image'; then # Ajustado grep para cobrir mais casos
+    if echo "$OUTPUT" | grep -q -E 'Pull complete|Downloaded newer image|Newer image'; then
         log "🔄 Atualizações encontradas para $COMPOSE_PATH, subindo novos containers com --force-recreate..."
         # Captura a saída e o status de saída do up
         if UP_OUTPUT=$(docker compose up -d --remove-orphans --force-recreate 2>&1); then
-            UPDATED_CONTAINERS+=("$COMPOSE_PATH")
             log "✅ Atualizado com sucesso: $COMPOSE_PATH"
             echo "$UP_OUTPUT" >> "$LOG_FILE"
+            UPDATED_COMPOSE_PATHS+=("$COMPOSE_PATH")
+
+            # --- Comparar imagens após 'up' --- 
+            log "🔎 Verificando imagens atualizadas para $COMPOSE_PATH..."
+            updated_images_list=""
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == NAME* ]] && continue
+                service_name=$(echo "$line" | awk '{print $1}')
+                new_image_name=$(echo "$line" | awk '{print $2}')
+                if [[ -n "$service_name" && -n "$new_image_name" ]]; then
+                    current_image=${current_images["$service_name"]}
+                    # Compara imagem antiga com a nova. Adiciona à lista se diferente.
+                    if [[ -n "$current_image" && "$current_image" != "$new_image_name" ]]; then
+                        log "  -> Serviço atualizado: $service_name ( $current_image -> $new_image_name )"
+                        updated_images_list+="* $service_name: 
+    $new_image_name\n"
+                    elif [[ -z "$current_image" && -n "$new_image_name" ]]; then
+                         # Caso o serviço não existia antes (novo serviço ou primeiro 'up')
+                         log "  -> Novo serviço/imagem: $service_name ($new_image_name)"
+                         updated_images_list+="* $service_name: 
+    $new_image_name (Novo)\n"
+                    fi
+                fi
+            done < <(docker compose ps --format "{{.Name}} {{.Image}}" 2>/dev/null || true)
+            
+            if [[ -n "$updated_images_list" ]]; then
+                 UPDATED_IMAGES_MAP["$COMPOSE_PATH"]="$updated_images_list"
+            fi
+            # --- Fim da comparação --- 
+
         else
             up_exit_code=$?
             ERRORS+=("Erro ao atualizar $COMPOSE_PATH (Código de saída: $up_exit_code)")
@@ -84,17 +136,25 @@ if ! docker image prune -af >> "$LOG_FILE" 2>&1; then
 fi
 
 # Verifica e envia notificações
-if [ ${#UPDATED_CONTAINERS[@]} -gt 0 ]; then
-    # Usando mapfile/readarray para construir a mensagem de forma mais segura (requer Bash 4+)
-    mapfile -t updated_list < <(printf '%s\n' "${UPDATED_CONTAINERS[@]}")
-    msg="🚀 Atualizações aplicadas nos seguintes composes:\n$(printf '* %s\n' "${updated_list[@]}")"
+if [ ${#UPDATED_COMPOSE_PATHS[@]} -gt 0 ]; then
+    msg="🚀 **Atualizações aplicadas nos seguintes composes:** \n\n"
+    for path in "${UPDATED_COMPOSE_PATHS[@]}"; do
+        msg+="📁 **$path**\n"
+        if [[ -v UPDATED_IMAGES_MAP["$path"] ]]; then
+             msg+="${UPDATED_IMAGES_MAP["$path"]}\n"
+        else
+             msg+="  *(Detalhes da imagem não capturados)*\n\n"
+        fi
+    done
     log "📣 Enviando notificação de sucesso..."
     send_discord "$msg"
 fi
 
 if [ ${#ERRORS[@]} -gt 0 ]; then
+    # Usando mapfile/readarray para construir a mensagem de forma mais segura (requer Bash 4+)
     mapfile -t error_list < <(printf '%s\n' "${ERRORS[@]}")
-    msg="⚠️ Erros durante atualização:\n$(printf '* %s\n' "${error_list[@]}")"
+    # Adicionado espaço antes do \n
+    msg="⚠️ **Erros durante atualização:** \n$(printf '* %s\n' "${error_list[@]}")"
     log "📣 Enviando notificação de erro..."
     send_discord "$msg"
 fi
