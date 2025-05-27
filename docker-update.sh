@@ -1,76 +1,73 @@
 #!/bin/bash
 
-# Configurações
+# Diretório de composes
+COMPOSE_DIR="/app/docker"
+
+# Diretório de log
+LOG_DIR="/var/log/docker-updater"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/$(date +'%Y-%m-%d').log"
+
+# Webhook do Discord
 DISCORD_WEBHOOK="SUA URL DISCORD AQUI"
-LOG_FILE="/var/log/docker_rolling_update.log"
-COMPOSE_BASE_DIR="/app/docker"
-TEMP_DIR="/tmp/docker_rolling_update"
-mkdir -p "$TEMP_DIR"
 
-message_log="### Atualização de containers - $(date '+%Y-%m-%d %H:%M:%S')\n"
-
-# Função para enviar mensagem para o Discord
-send_discord_message() {
-    local content="$1"
-    curl -s -H "Content-Type: application/json" \
-        -X POST \
-        -d "{\"content\": \"$content\"}" \
-        "$DISCORD_WEBHOOK" > /dev/null
+# Função para registrar logs com timestamp
+log() {
+    echo "$(date +'%F %T') - $1" | tee -a "$LOG_FILE"
 }
 
-# Verifica todos os subdiretórios em /app/docker que possuem docker-compose.yml
-updated_services=()
-error_services=()
+# Função para enviar mensagem ao Discord
+send_discord() {
+    local message="$1"
+    curl -s -H "Content-Type: application/json" \
+         -X POST \
+         -d "{\"content\": \"$message\"}" \
+         "$DISCORD_WEBHOOK" > /dev/null
+}
 
-for compose_file in $(find "$COMPOSE_BASE_DIR" -type f -name "docker-compose.yml"); do
-    compose_dir=$(dirname "$compose_file")
-    cd "$compose_dir" || continue
+log "🔄 Iniciando verificação de atualizações de containers Docker..."
 
-    echo "Verificando $compose_dir" | tee -a "$LOG_FILE"
+UPDATED_CONTAINERS=()
+ERRORS=()
 
-    # Lista imagens atuais
-    current_images=$(docker compose images --quiet)
+# Procurar arquivos docker-compose.{yml,yaml}
+find "$COMPOSE_DIR" -type f \( -name "docker-compose.yml" -o -name "docker-compose.yaml" \) | while read -r COMPOSE_FILE; do
+    COMPOSE_PATH=$(dirname "$COMPOSE_FILE")
+    log "📁 Verificando compose em: $COMPOSE_PATH"
 
-    # Puxa novas imagens
-    docker compose pull &>> "$LOG_FILE"
-    if [ $? -ne 0 ]; then
-        message_log+=":x: Falha ao executar 'docker compose pull' em ${compose_dir}\n"
-        error_services+=("$compose_dir")
-        continue
-    fi
+    cd "$COMPOSE_PATH" || { log "❌ Falha ao acessar $COMPOSE_PATH"; ERRORS+=("Erro ao acessar $COMPOSE_PATH"); continue; }
 
-    # Lista novamente as imagens para detectar mudanças
-    new_images=$(docker compose images --quiet)
+    log "📥 Fazendo pull das imagens..."
+    OUTPUT=$(docker compose pull 2>&1)
+    echo "$OUTPUT" >> "$LOG_FILE"
 
-    if [[ "$current_images" != "$new_images" ]]; then
-        # Atualização detectada
-        message_log+=":arrow_up: Atualização detectada em ${compose_dir}\n"
-
-        # Atualiza os containers (modo rolling)
-        docker compose up -d --remove-orphans &>> "$LOG_FILE"
-        if [ $? -eq 0 ]; then
-            updated_services+=("$compose_dir")
+    if echo "$OUTPUT" | grep -q "Downloaded newer image"; then
+        log "🔄 Atualizações encontradas, subindo novos containers..."
+        if docker compose up -d --remove-orphans >> "$LOG_FILE" 2>&1; then
+            UPDATED_CONTAINERS+=("$COMPOSE_PATH")
+            log "✅ Atualizado com sucesso: $COMPOSE_PATH"
         else
-            message_log+=":x: Erro ao atualizar containers em ${compose_dir}\n"
-            error_services+=("$compose_dir")
+            ERRORS+=("Erro ao atualizar $COMPOSE_PATH")
+            log "❌ Falha ao atualizar: $COMPOSE_PATH"
         fi
     else
-        echo "Sem mudanças em $compose_dir"
+        log "✅ Nenhuma atualização para: $COMPOSE_PATH"
     fi
 done
 
-# Aguarda containers ficarem UP
-sleep 5
-if docker ps | grep -q Exited; then
-    message_log+=":warning: Há containers em estado *Exited* após atualização.\n"
-    docker ps -a | grep Exited >> "$LOG_FILE"
+log "🧹 Limpando imagens não utilizadas..."
+docker image prune -af >> "$LOG_FILE" 2>&1
+
+if [ ${#UPDATED_CONTAINERS[@]} -gt 0 ]; then
+    msg="🚀 Atualizações aplicadas nos seguintes composes:\n$(printf '%s\n' "${UPDATED_CONTAINERS[@]}")"
+    log "📣 $msg"
+    send_discord "$msg"
 fi
 
-# Limpa imagens não utilizadas
-docker image prune -af --filter "until=24h" &>> "$LOG_FILE"
-message_log+=":recycle: Limpeza de imagens antigas realizada.\n"
-
-# Envia relatório se houve mudanças ou erros
-if [[ ${#updated_services[@]} -gt 0 || ${#error_services[@]} -gt 0 ]]; then
-    send_discord_message "$message_log"
+if [ ${#ERRORS[@]} -gt 0 ]; then
+    msg="⚠️ Erros durante atualização:\n$(printf '%s\n' "${ERRORS[@]}")"
+    log "📣 $msg"
+    send_discord "$msg"
 fi
+
+log "✅ Script finalizado."
